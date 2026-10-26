@@ -1,0 +1,9 @@
+.env
+.venv
+venv
+__pycache__
+*.pyc
+.git
+.gitignore
+push_to_github.bat
+run.bat
