@@ -1,7 +1,9 @@
 import os
 import re
 import sys
+import time
 import unicodedata
+from collections import defaultdict, deque
 from pathlib import Path
 from janome.tokenizer import Tokenizer
 
@@ -578,6 +580,12 @@ async def on_ready():
     except Exception as e:
         print(f"[WARNING] コマンド同期失敗: {e}")
 
+# ユーザーごとの直近短文メッセージキャッシュ（「う」「ん」「ち」等の分割連投による貫通対策）
+# key: (channel_id, user_id) -> deque of {"msg": discord.Message, "text": str, "time": float}
+SPLIT_WORD_MAX_HISTORY = 8
+SPLIT_WORD_EXPIRATION_SEC = 25.0  # 25秒以内の短文連投を追跡
+recent_user_messages: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=SPLIT_WORD_MAX_HISTORY))
+
 @bot.event
 async def on_message(message: discord.Message):
     # Bot自身やWebhookのメッセージは無視（無限ループ防止）
@@ -589,17 +597,51 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # NG判定（形態素解析・漢字読み仮名・ローマ字・誤爆防止）
+    channel = message.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await bot.process_commands(message)
+        return
+
+    now = time.time()
+    user_key = (channel.id, message.author.id)
+    history = recent_user_messages[user_key]
+
+    # 有効期限切れ（25秒以上前）の履歴を破棄
+    while history and (now - history[0]["time"] > SPLIT_WORD_EXPIRATION_SEC):
+        history.popleft()
+
+    # 1. メッセージ単体でのNG判定
     is_ng, reason = content_filter.is_ng(message.content)
+    past_messages_to_delete: list[discord.Message] = []
+
+    # 2. 単体でNGにならなかった場合、直近の短文履歴と結合して判定（「う」「ん」「ち」等の分割貫通対策）
+    if not is_ng and history:
+        # 直近の履歴を末尾から順に遡って結合パターンを検証
+        # 例: 履歴 [「う」, 「ん」] + 今回「ち」 -> 「うんち」で検知
+        combined_text = message.content
+        temp_past_msgs = []
+        for item in reversed(history):
+            combined_text = item["text"] + combined_text
+            temp_past_msgs.insert(0, item["msg"])
+            hit_split, reason_split = content_filter.is_ng(combined_text)
+            if hit_split:
+                is_ng = True
+                reason = f"分割連投検知 ({reason_split}) [結合文: '{combined_text}']"
+                past_messages_to_delete = temp_past_msgs
+                break
 
     if is_ng:
-        channel = message.channel
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            return
-
+        history.clear()
         print(f"[CENSOR] メッセージ検知・置換実行: {reason} | 投稿者: {message.author.display_name}")
 
-        # 1. 元のメッセージを削除
+        # 過去の分割パーツメッセージも削除
+        for past_msg in past_messages_to_delete:
+            try:
+                await past_msg.delete()
+            except Exception:
+                pass
+
+        # 今回のメッセージを削除
         try:
             await message.delete()
         except discord.Forbidden:
@@ -608,7 +650,7 @@ async def on_message(message: discord.Message):
         except discord.NotFound:
             pass
 
-        # 2. Webhookを取得・作成して投稿（元の文関係なく「うわっ⚡」のみを投稿）
+        # Webhookを取得・作成して投稿（「うわっ⚡」のみを投稿）
         webhook = await get_or_create_webhook(channel)
         if webhook:
             thread_arg = channel if isinstance(channel, discord.Thread) else discord.utils.MISSING
@@ -630,6 +672,14 @@ async def on_message(message: discord.Message):
                 f"**{message.author.display_name}**: {REPLACEMENT_TEXT}"
             )
         return
+
+    # NGではなかった場合、短文（空白除いて4文字以下）なら履歴に追加
+    stripped_text = re.sub(r'\s+', '', message.content)
+    if 0 < len(stripped_text) <= 4:
+        history.append({"msg": message, "text": stripped_text, "time": now})
+    else:
+        # 長文が挟まった場合は分割連投の文脈が途切れたとみなしてリセット
+        history.clear()
 
     await bot.process_commands(message)
 
