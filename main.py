@@ -219,6 +219,29 @@ def remove_sokuon_safely(text: str) -> str:
     removed = re.sub(r'っ+', '', protected)
     return removed.replace('_BAKKA_', 'ばっか').replace('_BAKKARI_', 'ばっかり').replace('_SAFE_BAKKA_', 'ばっか')
 
+# 文字間に挟まれる空白・括弧・区切り記号・装飾文字の除去用パターン（「う ん ち」「う(ん)ち」「う・ん・ち」等）
+SYMBOLS_CLASS_RAW = r'[\s　\(\)（）\[\]［］\{\}｛｝【】『』「」〈〉《》〔〕・、。.,/／_\-―~～〜\*＊:;！？!\?\^#\+=&|@＠\$%¥￥w草笑○〇●]'
+SYMBOLS_RE = re.compile(SYMBOLS_CLASS_RAW + "+", re.IGNORECASE)
+
+def strip_symbols(text: str) -> str:
+    """文字間に挟まれた空白・括弧・記号・装飾文字を除去して1つの連続文字列にする"""
+    return SYMBOLS_RE.sub('', text)
+
+# 英語の伏せ字・記号挟み検知パターン（f*ck, f**k, f u c k, s*x, sh*t, b!tch 等）
+ENGLISH_OBSCENE_PATTERNS = [
+    (re.compile(r'\bf+[\s*._\-!@#$%^&*()]*[u\*xX_0-9]+[\s*._\-!@#$%^&*()]*[c\*xX_0-9]*[\s*._\-!@#$%^&*()]*k+\b', re.I), "fuck"),
+    (re.compile(r'\bf+[\*xX_!@#$%^&*()]{2,}k+\b', re.I), "fuck (obfuscated)"),
+    (re.compile(r'\bf+[\s*._\-!@#$%^&*()]+u+[\s*._\-!@#$%^&*()]+c+[\s*._\-!@#$%^&*()]+k+\b', re.I), "f u c k"),
+    (re.compile(r'\bs+[\s*._\-!@#$%^&*()]*[h\*xX_0-9]+[\s*._\-!@#$%^&*()]*[i\*xX_0-9!|1]+[\s*._\-!@#$%^&*()]*t+\b', re.I), "shit"),
+    (re.compile(r'\bb+[\s*._\-!@#$%^&*()]*[i\*xX_0-9!|1]+[\s*._\-!@#$%^&*()]*t+[\s*._\-!@#$%^&*()]*c+[\s*._\-!@#$%^&*()]*h+\b', re.I), "bitch"),
+    (re.compile(r'\bs+[\s*._\-!@#$%^&*()]*[e\*xX_0-93]+[\s*._\-!@#$%^&*()]*x+\b', re.I), "sex"),
+    (re.compile(r'\bd+[\s*._\-!@#$%^&*()]*[i\*xX_0-9!|1]+[\s*._\-!@#$%^&*()]*c+[\s*._\-!@#$%^&*()]*k+\b', re.I), "dick"),
+    (re.compile(r'\bp+[\s*._\-!@#$%^&*()]*u+[\s*._\-!@#$%^&*()]*s+[\s*._\-!@#$%^&*()]*s+[\s*._\-!@#$%^&*()]*y+\b', re.I), "pussy"),
+    (re.compile(r'\ba+[\s*._\-!@#$%^&*()]*s+[\s*._\-!@#$%^&*()]*s+[\s*._\-!@#$%^&*()]*h+[\s*._\-!@#$%^&*()]*o+[\s*._\-!@#$%^&*()]*l+[\s*._\-!@#$%^&*()]*e+\b', re.I), "asshole"),
+    (re.compile(r'\bn+[\s*._\-!@#$%^&*()]*i+[\s*._\-!@#$%^&*()]*g+[\s*._\-!@#$%^&*()]*g+[\s*._\-!@#$%^&*()]*e+[\s*._\-!@#$%^&*()]*r+\b', re.I), "nigger"),
+    (re.compile(r'\bn+[\s*._\-!@#$%^&*()]*i+[\s*._\-!@#$%^&*()]*g+[\s*._\-!@#$%^&*()]*g+[\s*._\-!@#$%^&*()]*a+\b', re.I), "nigga"),
+]
+
 KANJI_RE = re.compile(r'[\u4e00-\u9fff]')
 
 def generate_word_variants(word: str) -> set[str]:
@@ -397,6 +420,18 @@ class ContentFilter:
 
         return False, ""
 
+    def _check_separated_short_words(self, text: str) -> tuple[bool, str]:
+        """「ば　か」「し・ね」「ば(か)」「く...そ」のように2文字短語の間に記号や空白を挟んだ貫通を検知"""
+        for w in self.short_words:
+            if len(w) == 2:
+                c1, c2 = w[0], w[1]
+                # 間に1〜6文字の空白・括弧・記号・装飾文字が挟まっているか
+                pat = re.escape(c1) + SYMBOLS_CLASS_RAW + r'{1,6}' + re.escape(c2)
+                m = re.search(pat, text, flags=re.IGNORECASE)
+                if m:
+                    return True, f"記号挟み短語検知: '{m.group(0)}' ({w})"
+        return False, ""
+
     def _check_text_candidates(self, text_candidate: str) -> tuple[bool, str]:
         """与えられたテキスト候補（通常文またはローマ字変換文）に対してNG判定を行う"""
         if not text_candidate:
@@ -408,28 +443,38 @@ class ContentFilter:
         sokuon_text = remove_sokuon_safely(norm_text)
         sokuon_elong = remove_sokuon_safely(elong_text)
 
-        # 判定1: 「死ね / しね」のコンテキスト判定（原文・正規化文・引き伸ばし圧縮文・促音除去文）
-        for txt in [text_candidate, norm_text, elong_text, sokuon_text]:
+        # 空白・括弧・記号除去文（「う ん ち」「う(ん)ち」「う・ん・ち」等の貫通対策）
+        clean_norm = strip_symbols(norm_text)
+        clean_read = strip_symbols(read_text)
+        clean_elong = strip_symbols(elong_text)
+        clean_sokuon = strip_symbols(sokuon_text)
+
+        # 判定1: 「死ね / しね」のコンテキスト判定（原文・正規化文・引き伸ばし文・記号除去文）
+        for txt in [text_candidate, norm_text, elong_text, sokuon_text, clean_norm, clean_elong]:
             hit_shine, reason_shine = self._check_shine(txt)
             if hit_shine:
                 return True, reason_shine
 
         # 判定2: 「ばっか（＝バカ）」の文脈判定（ばっかだなー等の検知＆ばかり等の除外）
-        hit_bakka, reason_bakka = self._check_bakka(text_candidate)
-        if hit_bakka:
-            return True, reason_bakka
-        hit_bakka_norm, reason_bakka_norm = self._check_bakka(norm_text)
-        if hit_bakka_norm:
-            return True, reason_bakka_norm
+        for txt in [text_candidate, norm_text, clean_norm]:
+            hit_bakka, reason_bakka = self._check_bakka(txt)
+            if hit_bakka:
+                return True, reason_bakka
 
-        # 判定3: 3文字以上の単語・フレーズ・漢字単語の照合（原文、正規化文、読み仮名文、引き伸ばし圧縮文、促音除去文）
+        # 判定3: 2文字短語の記号・空白挟み判定（例: ば か, ば・か, 死 ね, く...そ 等）
+        hit_sep, reason_sep = self._check_separated_short_words(norm_text)
+        if hit_sep:
+            return True, reason_sep
+
+        # 判定4: 3文字以上の単語・フレーズ・漢字単語の照合（原文、正規化文、読み仮名文、記号除去文等）
         if self.phrase_pattern:
-            for cand in [text_candidate, norm_text, read_text, elong_text, sokuon_text, sokuon_elong]:
+            for cand in [text_candidate, norm_text, read_text, elong_text, sokuon_text, sokuon_elong,
+                         clean_norm, clean_read, clean_elong, clean_sokuon]:
                 m = self.phrase_pattern.search(cand)
                 if m:
                     return True, f"フレーズ検知: {m.group(0)}"
 
-        # 判定4: 2文字以下の短いひらがな単語の形態素解析（ピエロ、チーズ、あくび等の誤爆を確実に防止）
+        # 判定5: 2文字以下の短いひらがな単語の形態素解析（ピエロ、チーズ、あくび等の誤爆を確実に防止）
         if self.short_words:
             tokens = list(tokenizer.tokenize(text_candidate))
             token_count = len(tokens)
@@ -460,23 +505,31 @@ class ContentFilter:
         return False, ""
 
     def is_ng(self, text: str) -> tuple[bool, str]:
-        """NGワードが含まれているかを判定する（通常判定 + ローマ字変換判定）"""
+        """NGワードが含まれているかを判定する（通常判定 + 英語伏せ字判定 + ローマ字変換判定）"""
         if not text:
             return False, ""
 
-        # 1. 通常判定（日本語テキスト）
+        # 1. 英語の伏せ字・記号挟み判定（f*ck, f u c k, s*x, sh*t, b!tch 等）
+        if re.search(r'[a-zA-Z]', text):
+            for pat, name in ENGLISH_OBSCENE_PATTERNS:
+                m = pat.search(text)
+                if m:
+                    return True, f"英語伏せ字検知: '{m.group(0)}' ({name})"
+
+        # 2. 通常判定（日本語テキスト・記号除去テキスト）
         is_hit, reason = self._check_text_candidates(text)
         if is_hit:
             return True, reason
 
-        # 2. 英字が含まれる場合、ローマ字（ヘボン式・訓令式）をひらがなに変換して判定
+        # 3. 英字が含まれる場合、ローマ字（ヘボン式・訓令式）をひらがなに変換して判定
         #    例: GAIJI / GAIZI -> がいじ, BAKA -> ばか, KUSO -> くそ 等
         if re.search(r'[a-zA-Z]', text):
-            romaji_converted = romaji_to_hira(text)
-            if romaji_converted != text.lower():
-                is_hit_romaji, reason_romaji = self._check_text_candidates(romaji_converted)
-                if is_hit_romaji:
-                    return True, f"ローマ字検知 ({reason_romaji})"
+            for raw_eng in [text, strip_symbols(text)]:
+                romaji_converted = romaji_to_hira(raw_eng)
+                if romaji_converted != raw_eng.lower():
+                    is_hit_romaji, reason_romaji = self._check_text_candidates(romaji_converted)
+                    if is_hit_romaji:
+                        return True, f"ローマ字検知 ({reason_romaji})"
 
         return False, ""
 
