@@ -1,0 +1,16 @@
+# 機密情報（Botトークン）
+.env
+
+# Python仮想環境
+.venv/
+venv/
+ENV/
+
+# キャッシュ
+__pycache__/
+*.pyc
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
