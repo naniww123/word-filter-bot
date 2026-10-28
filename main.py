@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -24,7 +25,9 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # 設定
 NG_WORDS_FILE = Path(__file__).parent / "ng_words.txt"
-REPLACEMENT_TEXT = "うわっ⚡"
+GUILD_SETTINGS_FILE = Path(__file__).parent / "guild_settings.json"
+DEFAULT_REPLACEMENT_TEXT = "うわっ⚡"
+REPLACEMENT_TEXT = DEFAULT_REPLACEMENT_TEXT  # 後方互換用
 
 # ========================================================
 # Render.com / 常時起動用ヘルスチェックWebサーバー
@@ -533,13 +536,93 @@ class ContentFilter:
 
         return False, ""
 
-# フィルターインスタンスと単語リスト
+# 単語リストとサーバー別フィルターキャッシュ
+base_ng_words: list[str] = []
+default_filter: ContentFilter | None = None
+guild_settings: dict[str, dict] = {}
+guild_filters: dict[int, ContentFilter] = {}
+
+# 後方互換用
 ng_words: list[str] = []
 content_filter: ContentFilter | None = None
 
+def load_guild_settings() -> dict:
+    """guild_settings.json から各サーバーの設定を読み込む"""
+    global guild_settings
+    if GUILD_SETTINGS_FILE.exists():
+        try:
+            with open(GUILD_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                guild_settings = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] サーバー設定ファイルの読み込みに失敗しました: {e}")
+            guild_settings = {}
+    else:
+        guild_settings = {}
+    return guild_settings
+
+def save_guild_settings() -> None:
+    """各サーバーの設定を guild_settings.json に保存する"""
+    try:
+        with open(GUILD_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(guild_settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ERROR] サーバー設定ファイルの保存に失敗しました: {e}")
+
+def get_guild_setting(guild_id: int | None) -> dict:
+    """指定されたサーバーの設定辞書を取得する（未設定の場合はデフォルトで初期化）"""
+    if not guild_id:
+        return {
+            "replacement_text": DEFAULT_REPLACEMENT_TEXT,
+            "custom_words": [],
+            "disabled_base_words": []
+        }
+    gid_str = str(guild_id)
+    if gid_str not in guild_settings:
+        guild_settings[gid_str] = {
+            "replacement_text": DEFAULT_REPLACEMENT_TEXT,
+            "custom_words": [],
+            "disabled_base_words": []
+        }
+    else:
+        # 必要なキーが存在することを保証
+        guild_settings[gid_str].setdefault("replacement_text", DEFAULT_REPLACEMENT_TEXT)
+        guild_settings[gid_str].setdefault("custom_words", [])
+        guild_settings[gid_str].setdefault("disabled_base_words", [])
+    return guild_settings[gid_str]
+
+def get_replacement_text(guild_id: int | None) -> str:
+    """サーバー設定の置換テキストを取得する（未設定時は DEFAULT_REPLACEMENT_TEXT）"""
+    if not guild_id:
+        return DEFAULT_REPLACEMENT_TEXT
+    setting = get_guild_setting(guild_id)
+    text = setting.get("replacement_text")
+    return text if text else DEFAULT_REPLACEMENT_TEXT
+
+def get_guild_filter(guild_id: int | None) -> ContentFilter:
+    """サーバー固有の有効NGワードで構成された ContentFilter を取得する（キャッシュ対応）"""
+    if not guild_id:
+        return default_filter or ContentFilter(base_ng_words)
+    if guild_id in guild_filters:
+        return guild_filters[guild_id]
+
+    setting = get_guild_setting(guild_id)
+    custom_words = set(setting.get("custom_words", []))
+    disabled_words = set(setting.get("disabled_base_words", []))
+
+    # 有効なNGワード = (基本NGワード - 無効化ワード) + サーバー独自追加ワード
+    active_words = (set(base_ng_words) - disabled_words) | custom_words
+    cf = ContentFilter(sorted(list(active_words)))
+    guild_filters[guild_id] = cf
+    return cf
+
+def invalidate_guild_filter(guild_id: int | None) -> None:
+    """サーバーの設定変更時にフィルターキャッシュを破棄する"""
+    if guild_id is not None:
+        guild_filters.pop(guild_id, None)
+
 def load_ng_words() -> list[str]:
-    """ng_words.txt からNGワードを読み込み、ContentFilterを再構築する"""
-    global ng_words, content_filter
+    """ng_words.txt からNGワードを読み込み、基本フィルターを再構築する"""
+    global base_ng_words, default_filter, ng_words, content_filter
     if not NG_WORDS_FILE.exists():
         default_words = [
             "ばか", "アホ", "死ね", "クソ", "カス", "ゴミ",
@@ -558,13 +641,19 @@ def load_ng_words() -> list[str]:
             if word and not word.startswith("#"):
                 words.append(word)
 
-    ng_words = sorted(list(set(words)))
-    content_filter = ContentFilter(ng_words)
-    print(f"[INFO] NGワードを {len(ng_words)} 件読み込みました。（形態素解析・漢字読み仮名・ローマ字・誤爆防止が有効）")
-    return ng_words
+    base_ng_words = sorted(list(set(words)))
+    default_filter = ContentFilter(base_ng_words)
+    # 後方互換用
+    ng_words = base_ng_words
+    content_filter = default_filter
+
+    # 全サーバーのキャッシュをクリア（基本ワード更新のため）
+    guild_filters.clear()
+    print(f"[INFO] 基本NGワードを {len(base_ng_words)} 件読み込みました。（形態素解析・漢字読み仮名・ローマ字・誤爆防止が有効）")
+    return base_ng_words
 
 def save_ng_words(words: list[str]) -> None:
-    """NGワードを ng_words.txt に保存する"""
+    """NGワードを ng_words.txt に保存する（基本辞書の更新）"""
     sorted_words = sorted(list(set(words)))
     with open(NG_WORDS_FILE, "w", encoding="utf-8") as f:
         f.write("# 1行に1つ、置き換え対象にしたいワード（NGワード）を記入してください。\n")
@@ -576,6 +665,7 @@ def save_ng_words(words: list[str]) -> None:
 
 # 初回読み込み
 load_ng_words()
+load_guild_settings()
 
 # Bot設定 (メッセージ内容の取得権限を有効化)
 intents = discord.Intents.default()
@@ -624,7 +714,8 @@ async def get_or_create_webhook(channel: discord.TextChannel | discord.Thread) -
 async def on_ready():
     print("=" * 50)
     print(f"ログイン成功: {bot.user.name} (ID: {bot.user.id})")
-    print(f"置換フレーズ: 「{REPLACEMENT_TEXT}」")
+    print(f"デフォルト置換フレーズ: 「{DEFAULT_REPLACEMENT_TEXT}」")
+    print(f"サーバー個別設定読み込み済み: {len(guild_settings)} サーバー")
     print("形態素解析・ローマ字検知・誤爆防止フィルター稼働中⚡")
     print("=" * 50)
     try:
@@ -645,8 +736,8 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id:
         return
 
-    # メッセージ本文またはフィルターが存在しない場合は何もしない
-    if not message.content or not content_filter:
+    # メッセージ本文が存在しない場合は何もしない
+    if not message.content:
         await bot.process_commands(message)
         return
 
@@ -654,6 +745,10 @@ async def on_message(message: discord.Message):
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         await bot.process_commands(message)
         return
+
+    guild_id = message.guild.id if message.guild else None
+    active_filter = get_guild_filter(guild_id)
+    replacement_text = get_replacement_text(guild_id)
 
     now = time.time()
     user_key = (channel.id, message.author.id)
@@ -664,7 +759,7 @@ async def on_message(message: discord.Message):
         history.popleft()
 
     # 1. メッセージ単体でのNG判定
-    is_ng, reason = content_filter.is_ng(message.content)
+    is_ng, reason = active_filter.is_ng(message.content)
     past_messages_to_delete: list[discord.Message] = []
 
     # 2. 単体でNGにならなかった場合、直近の短文履歴と結合して判定（「う」「ん」「ち」等の分割貫通対策）
@@ -676,7 +771,7 @@ async def on_message(message: discord.Message):
         for item in reversed(history):
             combined_text = item["text"] + combined_text
             temp_past_msgs.insert(0, item["msg"])
-            hit_split, reason_split = content_filter.is_ng(combined_text)
+            hit_split, reason_split = active_filter.is_ng(combined_text)
             if hit_split:
                 is_ng = True
                 reason = f"分割連投検知 ({reason_split}) [結合文: '{combined_text}']"
@@ -685,7 +780,8 @@ async def on_message(message: discord.Message):
 
     if is_ng:
         history.clear()
-        print(f"[CENSOR] メッセージ検知・置換実行: {reason} | 投稿者: {message.author.display_name}")
+        guild_name = message.guild.name if message.guild else "DM"
+        print(f"[CENSOR] [{guild_name}] メッセージ検知・置換実行: {reason} | 投稿者: {message.author.display_name}")
 
         # 過去の分割パーツメッセージも削除
         for past_msg in past_messages_to_delete:
@@ -703,7 +799,7 @@ async def on_message(message: discord.Message):
         except discord.NotFound:
             pass
 
-        # Webhookを取得・作成して投稿（「うわっ⚡」のみを投稿）
+        # Webhookを取得・作成して投稿（サーバー設定の replacement_text を投稿）
         webhook = await get_or_create_webhook(channel)
         if webhook:
             thread_arg = channel if isinstance(channel, discord.Thread) else discord.utils.MISSING
@@ -712,7 +808,7 @@ async def on_message(message: discord.Message):
 
             try:
                 await webhook.send(
-                    content=REPLACEMENT_TEXT,
+                    content=replacement_text,
                     username=display_name,
                     avatar_url=avatar_url,
                     thread=thread_arg,
@@ -722,7 +818,7 @@ async def on_message(message: discord.Message):
                 print(f"[ERROR] Webhookからのメッセージ送信に失敗しました: {e}")
         else:
             await channel.send(
-                f"**{message.author.display_name}**: {REPLACEMENT_TEXT}"
+                f"**{message.author.display_name}**: {replacement_text}"
             )
         return
 
@@ -737,72 +833,225 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 # ================================
-# スラッシュコマンド（NGワード管理）
+# スラッシュコマンド（NGワード＆メッセージ管理）
 # ================================
 
-@bot.tree.command(name="ng_list", description="登録されているNGワードの一覧を表示します")
+@bot.tree.command(name="ng_list", description="このサーバーのNGワード一覧と置換メッセージ設定を表示します")
 async def cmd_ng_list(interaction: discord.Interaction):
-    if not ng_words:
-        await interaction.response.send_message("登録されているNGワードはありません。", ephemeral=True)
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
         return
 
-    words_str = ", ".join(f"`{w}`" for w in ng_words)
-    await interaction.response.send_message(
-        f"**現在のNGワード一覧 ({len(ng_words)}件):**\n{words_str}\n\n※検知された発言は元の文に関係なく「{REPLACEMENT_TEXT}」に書き換えられます（誤爆防止・漢字読み仮名・ローマ字対応済み）。",
-        ephemeral=True
-    )
+    guild_id = interaction.guild.id
+    setting = get_guild_setting(guild_id)
+    rep_text = get_replacement_text(guild_id)
+    custom_words = setting.get("custom_words", [])
+    disabled_words = setting.get("disabled_base_words", [])
 
-@bot.tree.command(name="ng_add", description="新しいNGワードを追加します")
+    active_words = sorted(list((set(base_ng_words) - set(disabled_words)) | set(custom_words)))
+
+    lines = [
+        f"⚙️ **【{interaction.guild.name}】のNGワード設定**",
+        f"💬 **現在の置換メッセージ**: 「**{rep_text}**」",
+        f"📊 **有効なNGワード総数**: {len(active_words)} 件（基本: {len(base_ng_words) - len(disabled_words)}件 / サーバー追加: {len(custom_words)}件）\n"
+    ]
+
+    if custom_words:
+        custom_str = ", ".join(f"`{w}`" for w in sorted(custom_words))
+        lines.append(f"➕ **このサーバー専用の追加NGワード ({len(custom_words)}件):**\n{custom_str}\n")
+    else:
+        lines.append("➕ **このサーバー専用の追加NGワード**: なし\n")
+
+    if disabled_words:
+        disabled_str = ", ".join(f"`{w}`" for w in sorted(disabled_words))
+        lines.append(f"🚫 **このサーバーで無効化されている基本NGワード ({len(disabled_words)}件):**\n{disabled_str}\n")
+
+    lines.append("💡 **便利なコマンド:**")
+    lines.append("・`/ng_add <単語>`: このサーバーにNGワードを追加")
+    lines.append("・`/ng_remove <単語>`: このサーバーからNGワードを削除・除外")
+    lines.append("・`/ng_message <テキスト>`: 検知時の置換メッセージを変更（例: 「うわっ⚡」など）")
+    lines.append("・`/ng_message_reset`: 置換メッセージをデフォルトに戻す")
+
+    result_text = "\n".join(lines)
+    if len(result_text) > 1900:
+        result_text = result_text[:1850] + "\n...(文字数制限のため一部省略)..."
+
+    await interaction.response.send_message(result_text, ephemeral=True)
+
+@bot.tree.command(name="ng_add", description="このサーバーに新しいNGワードを追加します")
 @app_commands.describe(word="追加したいNGワード")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def cmd_ng_add(interaction: discord.Interaction, word: str):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
     word = word.strip()
     if not word:
         await interaction.response.send_message("有効な単語を指定してください。", ephemeral=True)
         return
 
-    if word in ng_words:
-        await interaction.response.send_message(f"「{word}」は既にNGワードに登録されています。", ephemeral=True)
+    guild_id = interaction.guild.id
+    setting = get_guild_setting(guild_id)
+    custom_words = setting.setdefault("custom_words", [])
+    disabled_words = setting.setdefault("disabled_base_words", [])
+
+    # 無効化リストに入っていた場合は復帰
+    if word in disabled_words:
+        disabled_words.remove(word)
+        save_guild_settings()
+        invalidate_guild_filter(guild_id)
+        await interaction.response.send_message(
+            f"無効化されていた「`{word}`」をこのサーバーのNGワードとして再有効化しました！",
+            ephemeral=True
+        )
         return
 
-    current = list(ng_words)
-    current.append(word)
-    save_ng_words(current)
-    await interaction.response.send_message(f"NGワードに「{word}」を追加しました！", ephemeral=True)
+    if word in custom_words or (word in base_ng_words and word not in disabled_words):
+        await interaction.response.send_message(
+            f"「`{word}`」は既にこのサーバーのNGワードとして登録されています。",
+            ephemeral=True
+        )
+        return
+
+    custom_words.append(word)
+    save_guild_settings()
+    invalidate_guild_filter(guild_id)
+    await interaction.response.send_message(
+        f"このサーバーのNGワードに「`{word}`」を追加しました！⚡\n（漢字・ひらがな・カタカナ・ローマ字等の表記ゆれも自動判定されます）",
+        ephemeral=True
+    )
 
 @cmd_ng_add.error
 async def cmd_ng_add_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
 
-@bot.tree.command(name="ng_remove", description="登録済みのNGワードを削除します")
+@bot.tree.command(name="ng_remove", description="このサーバーからNGワードを削除・除外します")
 @app_commands.describe(word="削除したいNGワード")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def cmd_ng_remove(interaction: discord.Interaction, word: str):
-    word = word.strip()
-    if word not in ng_words:
-        await interaction.response.send_message(f"「{word}」はNGワードに登録されていません。", ephemeral=True)
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
         return
 
-    current = [w for w in ng_words if w != word]
-    save_ng_words(current)
-    await interaction.response.send_message(f"NGワードから「{word}」を削除しました。", ephemeral=True)
+    word = word.strip()
+    if not word:
+        await interaction.response.send_message("有効な単語を指定してください。", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    setting = get_guild_setting(guild_id)
+    custom_words = setting.setdefault("custom_words", [])
+    disabled_words = setting.setdefault("disabled_base_words", [])
+
+    if word in custom_words:
+        custom_words.remove(word)
+        save_guild_settings()
+        invalidate_guild_filter(guild_id)
+        await interaction.response.send_message(f"このサーバーの追加NGワードから「`{word}`」を削除しました。", ephemeral=True)
+        return
+
+    if word in base_ng_words:
+        if word not in disabled_words:
+            disabled_words.append(word)
+            save_guild_settings()
+            invalidate_guild_filter(guild_id)
+            await interaction.response.send_message(f"基本NGワード「`{word}`」をこのサーバーで無効化しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"「`{word}`」は既にこのサーバーで無効化されています。", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"「`{word}`」はNGワードに登録されていません。", ephemeral=True)
 
 @cmd_ng_remove.error
 async def cmd_ng_remove_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
 
-@bot.tree.command(name="ng_reload", description="ng_words.txt からNGワードを再読み込みします")
+@bot.tree.command(name="ng_message", description="このサーバーでNGワード検知時に置き換える文字を変更します")
+@app_commands.describe(text="置き換え後のテキスト（例: うわっ⚡、暴言はダメ！、など）")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def cmd_ng_message(interaction: discord.Interaction, text: str):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    text = text.strip()
+    if not text:
+        await interaction.response.send_message("有効なテキストを指定してください。", ephemeral=True)
+        return
+
+    if len(text) > 100:
+        await interaction.response.send_message("置換テキストは100文字以内で指定してください。", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    setting = get_guild_setting(guild_id)
+    old_text = get_replacement_text(guild_id)
+    setting["replacement_text"] = text
+    save_guild_settings()
+
+    await interaction.response.send_message(
+        f"✅ このサーバーでの置換メッセージを変更しました！\n"
+        f"・変更前: 「{old_text}」\n"
+        f"・変更後: 「**{text}**」\n\n"
+        f"※元に戻したい場合は `/ng_message_reset` を実行してください。",
+        ephemeral=True
+    )
+
+@cmd_ng_message.error
+async def cmd_ng_message_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+
+@bot.tree.command(name="ng_message_reset", description="このサーバーの置換メッセージを初期設定（うわっ⚡）に戻します")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def cmd_ng_message_reset(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    setting = get_guild_setting(guild_id)
+    setting["replacement_text"] = DEFAULT_REPLACEMENT_TEXT
+    save_guild_settings()
+
+    await interaction.response.send_message(
+        f"✅ このサーバーでの置換メッセージをデフォルトの「**{DEFAULT_REPLACEMENT_TEXT}**」に戻しました。",
+        ephemeral=True
+    )
+
+@cmd_ng_message_reset.error
+async def cmd_ng_message_reset_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+
+@bot.tree.command(name="ng_reload", description="ng_words.txt とサーバー設定を再読み込みします")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def cmd_ng_reload(interaction: discord.Interaction):
     load_ng_words()
-    await interaction.response.send_message(f"NGワード設定を再読み込みしました（合計: {len(ng_words)}件）。", ephemeral=True)
+    load_guild_settings()
+    guild_filters.clear()
+    await interaction.response.send_message(
+        f"NGワードおよび全サーバー設定を再読み込みしました（基本NGワード: {len(base_ng_words)}件）。",
+        ephemeral=True
+    )
 
 @cmd_ng_reload.error
 async def cmd_ng_reload_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
 
 # 起動チェック
 if __name__ == "__main__":

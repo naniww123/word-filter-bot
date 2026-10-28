@@ -1,6 +1,9 @@
 # 機密情報（Botトークン）
 .env
 
+# サーバー固有の設定データ
+guild_settings.json
+
 # Python仮想環境
 .venv/
 venv/
