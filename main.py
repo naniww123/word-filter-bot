@@ -719,31 +719,22 @@ async def on_ready():
     print("形態素解析・ローマ字検知・誤爆防止フィルター稼働中⚡")
     print("=" * 50)
 
-    # 参加している全サーバーに即時同期（グローバル同期の最大1時間タイムラグを回避）
+    # サーバー固有（ギルド）コマンドの重複を削除してグローバルコマンドに一本化
     for guild in bot.guilds:
         try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"[INFO] サーバー『{guild.name}』にスラッシュコマンド {len(synced)} 件を即時同期しました。")
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"[INFO] サーバー『{guild.name}』の重複ギルドコマンドを削除しました。")
         except Exception as e:
-            print(f"[WARNING] サーバー『{guild.name}』への同期スキップ: {e}")
+            print(f"[WARNING] サーバー『{guild.name}』のギルドコマンド削除スキップ: {e}")
 
-    # グローバル同期も実行
+    # グローバルコマンドを同期
     try:
         global_synced = await bot.tree.sync()
         print(f"[INFO] グローバルコマンド {len(global_synced)} 件を同期しました。")
     except Exception as e:
         print(f"[WARNING] グローバルコマンド同期失敗: {e}")
 
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    """新しくサーバーに参加した際にコマンドを即時同期する"""
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        print(f"[INFO] 新規サーバー『{guild.name}』にコマンドを即時同期しました。")
-    except Exception as e:
-        print(f"[WARNING] 新規サーバー『{guild.name}』への同期失敗: {e}")
 
 
 # ユーザーごとの直近短文メッセージキャッシュ（「う」「ん」「ち」等の分割連投による貫通対策）
