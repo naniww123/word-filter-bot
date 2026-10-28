@@ -718,11 +718,33 @@ async def on_ready():
     print(f"サーバー個別設定読み込み済み: {len(guild_settings)} サーバー")
     print("形態素解析・ローマ字検知・誤爆防止フィルター稼働中⚡")
     print("=" * 50)
+
+    # 参加している全サーバーに即時同期（グローバル同期の最大1時間タイムラグを回避）
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"[INFO] サーバー『{guild.name}』にスラッシュコマンド {len(synced)} 件を即時同期しました。")
+        except Exception as e:
+            print(f"[WARNING] サーバー『{guild.name}』への同期スキップ: {e}")
+
+    # グローバル同期も実行
     try:
-        synced = await bot.tree.sync()
-        print(f"[INFO] スラッシュコマンド {len(synced)} 件を同期しました。")
+        global_synced = await bot.tree.sync()
+        print(f"[INFO] グローバルコマンド {len(global_synced)} 件を同期しました。")
     except Exception as e:
-        print(f"[WARNING] コマンド同期失敗: {e}")
+        print(f"[WARNING] グローバルコマンド同期失敗: {e}")
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """新しくサーバーに参加した際にコマンドを即時同期する"""
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"[INFO] 新規サーバー『{guild.name}』にコマンドを即時同期しました。")
+    except Exception as e:
+        print(f"[WARNING] 新規サーバー『{guild.name}』への同期失敗: {e}")
+
 
 # ユーザーごとの直近短文メッセージキャッシュ（「う」「ん」「ち」等の分割連投による貫通対策）
 # key: (channel_id, user_id) -> deque of {"msg": discord.Message, "text": str, "time": float}
