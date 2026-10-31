@@ -3,7 +3,7 @@ services:
     name: discord-censor-bot
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --pre -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: DISCORD_BOT_TOKEN
