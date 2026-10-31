@@ -1,18 +1,42 @@
+import asyncio
+import audioop
+import io
 import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from collections import defaultdict, deque
 from pathlib import Path
 from janome.tokenizer import Tokenizer
+import numpy as np
+import soundfile as sf
+import speech_recognition as sr
+from discord.ext import voice_recv
 
 # Windows環境でのコンソール文字化け対策
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+
+# soundfile による高速・堅牢な FLAC エンコード（外部 flac.exe 不要）
+try:
+    def _custom_get_flac_data(self, convert_rate=None, convert_width=None):
+        raw_bytes = self.get_raw_data(convert_rate, convert_width)
+        rate = self.sample_rate if convert_rate is None else convert_rate
+        data = np.frombuffer(raw_bytes, dtype=np.int16)
+        buf = io.BytesIO()
+        sf.write(buf, data, rate, format="FLAC")
+        return buf.getvalue()
+
+    sr.AudioData.get_flac_data = _custom_get_flac_data
+except Exception as e:
+    print(f"[WARNING] soundfile 初期化スキップ: {e}")
+speech_recognizer = sr.Recognizer()
+speech_recognizer.operation_timeout = 8.0
 
 import discord
 from discord import app_commands
@@ -667,23 +691,24 @@ def save_ng_words(words: list[str]) -> None:
 load_ng_words()
 load_guild_settings()
 
-# Bot設定 (メッセージ内容の取得権限を有効化)
+# Bot設定 (メッセージ内容およびボイス状態の取得権限を有効化)
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Webhookのキャッシュ (channel_id -> Webhook)
 webhook_cache: dict[int, discord.Webhook] = {}
 
-async def get_or_create_webhook(channel: discord.TextChannel | discord.Thread) -> discord.Webhook | None:
+async def get_or_create_webhook(channel: discord.TextChannel | discord.Thread | discord.VoiceChannel | discord.StageChannel) -> discord.Webhook | None:
     """チャンネルまたは親チャンネルに対応するWebhookを取得または作成する"""
-    target_channel: discord.TextChannel
+    target_channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel
     if isinstance(channel, discord.Thread):
-        if isinstance(channel.parent, discord.TextChannel):
+        if isinstance(channel.parent, (discord.TextChannel, discord.VoiceChannel)):
             target_channel = channel.parent
         else:
             return None
-    elif isinstance(channel, discord.TextChannel):
+    elif isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)):
         target_channel = channel
     else:
         return None
@@ -710,14 +735,270 @@ async def get_or_create_webhook(channel: discord.TextChannel | discord.Thread) -
         print(f"[ERROR] Webhookの取得・作成に失敗しました: {e}")
         return None
 
+
+# ========================================================
+# ボイスチャット・VCテキスト NGワード監視＆ペナルティ管理
+# ========================================================
+
+# ユーザーごとの警告管理
+# key: (guild_id, user_id) -> {"count": int, "last_warned": float}
+user_warnings: dict[tuple[int, int], dict] = {}
+# ミュート自動解除タスクの追跡
+# key: (guild_id, user_id) -> asyncio.Task
+active_mute_tasks: dict[tuple[int, int], asyncio.Task] = {}
+
+def get_warning_count(guild_id: int, user_id: int) -> int:
+    """指定ユーザーの現在の警告回数を取得（1時間以上空いていればリセット）"""
+    key = (guild_id, user_id)
+    data = user_warnings.get(key)
+    if not data:
+        return 0
+    if time.time() - data["last_warned"] > 3600:
+        del user_warnings[key]
+        return 0
+    return data["count"]
+
+def add_warning(guild_id: int, user_id: int) -> int:
+    """警告回数をインクリメントして最新回数を返す"""
+    key = (guild_id, user_id)
+    count = get_warning_count(guild_id, user_id) + 1
+    user_warnings[key] = {"count": count, "last_warned": time.time()}
+    return count
+
+def reset_warning(guild_id: int, user_id: int):
+    """指定ユーザーの警告回数をリセット"""
+    user_warnings.pop((guild_id, user_id), None)
+
+async def handle_violation(
+    guild: discord.Guild,
+    member: discord.Member,
+    channel: discord.abc.Messageable,
+    detected_text: str,
+    reason: str,
+    source: str
+):
+    """NGワード検知時の警告通知および3回警告時の5分間マイクミュート"""
+    count = add_warning(guild.id, member.id)
+
+    if count < 3:
+        embed = discord.Embed(
+            title="⚠️ NGワード警告",
+            description=f"{member.mention} さんがNGワードを発言しました。（{source}）",
+            color=discord.Color.yellow()
+        )
+        embed.add_field(name="検知内容", value=f"「{detected_text}」", inline=False)
+        embed.add_field(name="判定理由", value=reason, inline=True)
+        embed.add_field(name="警告状況", value=f"**{count} / 3 回**", inline=True)
+        embed.set_footer(text="※3回警告されると、5分間のマイクミュートが適用されます。")
+        try:
+            await channel.send(content=member.mention, embed=embed)
+        except Exception as e:
+            print(f"[ERROR] 警告メッセージ送信失敗: {e}")
+    else:
+        # 3回警告に達したためリセットして5分ミュート
+        reset_warning(guild.id, member.id)
+        embed = discord.Embed(
+            title="🚨 ペナルティ適用（5分間マイクミュート）",
+            description=f"{member.mention} さんの警告が3回に達したため、**5分間マイクミュート**されました。",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="検知内容", value=f"「{detected_text}」", inline=False)
+        embed.add_field(name="判定理由", value=reason, inline=True)
+        embed.add_field(name="ペナルティ", value="5分後に自動解除されます", inline=True)
+        try:
+            await channel.send(content=f"🚨 {member.mention}", embed=embed)
+        except Exception as e:
+            print(f"[ERROR] ミュート通知メッセージ送信失敗: {e}")
+
+        key = (guild.id, member.id)
+        if key in active_mute_tasks:
+            active_mute_tasks[key].cancel()
+
+        try:
+            await member.edit(mute=True, reason="NGワード3回検知によるペナルティ（5分間マイクミュート）")
+            task = asyncio.create_task(schedule_unmute(guild.id, member.id, channel, 300))
+            active_mute_tasks[key] = task
+        except discord.Forbidden:
+            await channel.send(
+                f"❌ {member.mention} をミュートできませんでした。\n"
+                "※Botに「メンバーをミュート（Mute Members）」権限が付与されているか、およびBotの役職が対象ユーザーより上位にあるか確認してください。"
+            )
+        except Exception as e:
+            print(f"[ERROR] サーバーミュート実行失敗: {e}")
+
+async def schedule_unmute(guild_id: int, user_id: int, channel: discord.abc.Messageable, delay_seconds: int):
+    """指定秒数後にサーバーミュートを解除する"""
+    await asyncio.sleep(delay_seconds)
+    key = (guild_id, user_id)
+    active_mute_tasks.pop(key, None)
+
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    member = guild.get_member(user_id)
+    if not member:
+        return
+
+    try:
+        await member.edit(mute=False, reason="5分間ペナルティ終了による自動解除")
+        embed = discord.Embed(
+            title="🔊 マイクミュート解除",
+            description=f"{member.mention} さんの5分間ペナルティが終了し、マイクミュートが解除されました。",
+            color=discord.Color.green()
+        )
+        await channel.send(content=member.mention, embed=embed)
+    except Exception as e:
+        print(f"[INFO] ミュート自動解除処理（既に退出済み等の可能性）: {e}")
+
+
+# ========================================================
+# 音声受信・音声認識（Speech-to-Text）マネージャー
+# ========================================================
+
+class VoiceDataManager:
+    def __init__(self):
+        self.buffers: dict[tuple[int, int], dict] = {}
+        self.lock = threading.Lock()
+
+    def add_packet(self, guild_id: int, user: discord.User | discord.Member, pcm: bytes, vc_channel_id: int):
+        if not user or user.bot or not pcm:
+            return
+        now = time.time()
+        key = (guild_id, user.id)
+        with self.lock:
+            if key not in self.buffers:
+                self.buffers[key] = {
+                    "pcm": bytearray(),
+                    "last_time": now,
+                    "vc_channel_id": vc_channel_id,
+                    "guild_id": guild_id,
+                    "user_id": user.id,
+                }
+            buf = self.buffers[key]
+            buf["pcm"].extend(pcm)
+            buf["last_time"] = now
+
+    def pop_ready_buffers(self) -> list[dict]:
+        now = time.time()
+        ready = []
+        with self.lock:
+            for key, buf in list(self.buffers.items()):
+                pcm_len = len(buf["pcm"])
+                elapsed_since_last = now - buf["last_time"]
+
+                # 48kHz, 16bit, 2ch -> 1秒 = 192,000 bytes
+                # 0.4秒 = 76,800 bytes
+                # 6.0秒 = 1,152,000 bytes
+                is_silence_timeout = (elapsed_since_last >= 0.8) and (pcm_len >= 76800)
+                is_max_length = pcm_len >= 1152000
+
+                if is_silence_timeout or is_max_length:
+                    ready.append({
+                        "guild_id": buf["guild_id"],
+                        "user_id": buf["user_id"],
+                        "vc_channel_id": buf["vc_channel_id"],
+                        "pcm": bytes(buf["pcm"]),
+                    })
+                    del self.buffers[key]
+                elif elapsed_since_last >= 1.5:
+                    del self.buffers[key]
+        return ready
+
+voice_data_manager = VoiceDataManager()
+
+def transcribe_pcm(pcm_bytes: bytes) -> str | None:
+    """ステレオ48kHz PCMデータをモノラル16kHzに変換してGoogle音声認識を実行"""
+    try:
+        mono_pcm = audioop.tomono(pcm_bytes, 2, 0.5, 0.5)
+        resampled_pcm, _ = audioop.ratecv(mono_pcm, 2, 1, 48000, 16000, None)
+        audio = sr.AudioData(resampled_pcm, 16000, 2)
+        text = speech_recognizer.recognize_google(audio, language="ja-JP")
+        return text.strip() if text else None
+    except sr.UnknownValueError:
+        return None
+    except sr.RequestError as e:
+        print(f"[WARNING] Google Speech Recognition API エラー: {e}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] 音声認識処理中の予期せぬ例外: {e}")
+        return None
+
+async def process_single_speech(item: dict):
+    guild_id = item["guild_id"]
+    user_id = item["user_id"]
+    channel_id = item["vc_channel_id"]
+    pcm = item["pcm"]
+
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    member = guild.get_member(user_id)
+    if not member:
+        return
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        return
+
+    text = await asyncio.to_thread(transcribe_pcm, pcm)
+    if not text:
+        return
+
+    active_filter = get_guild_filter(guild_id)
+    is_ng, reason = active_filter.is_ng(text)
+    if is_ng:
+        print(f"[VC CENSOR] [{guild.name}] 通話音声NG検知: {reason} | 発言者: {member.display_name} | 認識文: 「{text}」")
+        await handle_violation(
+            guild=guild,
+            member=member,
+            channel=channel,
+            detected_text=text,
+            reason=reason,
+            source="通話音声"
+        )
+
+async def voice_processor_loop():
+    """定期的に完了した音声バッファを認識ワーカーに投げてNGチェックするループ"""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            ready_list = voice_data_manager.pop_ready_buffers()
+            for item in ready_list:
+                asyncio.create_task(process_single_speech(item))
+        except Exception as e:
+            print(f"[ERROR] voice_processor_loop エラー: {e}")
+        await asyncio.sleep(0.2)
+
+class BotVoiceSink(voice_recv.AudioSink):
+    def __init__(self, guild_id: int, channel_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user: discord.User | discord.Member | None, data: voice_recv.VoiceData):
+        if user is None or (bot.user and user.id == bot.user.id):
+            return
+        voice_data_manager.add_packet(self.guild_id, user, data.pcm, self.channel_id)
+
+    def cleanup(self):
+        pass
+
 @bot.event
 async def on_ready():
     print("=" * 50)
     print(f"ログイン成功: {bot.user.name} (ID: {bot.user.id})")
     print(f"デフォルト置換フレーズ: 「{DEFAULT_REPLACEMENT_TEXT}」")
     print(f"サーバー個別設定読み込み済み: {len(guild_settings)} サーバー")
-    print("形態素解析・ローマ字検知・誤爆防止フィルター稼働中⚡")
+    print("形態素解析・ローマ字検知・ボイス監視・誤爆防止フィルター稼働中⚡")
     print("=" * 50)
+
+    # 音声監視ループタスクを起動
+    if not hasattr(bot, "_voice_processor_started"):
+        bot._voice_processor_started = True
+        asyncio.create_task(voice_processor_loop())
+        print("[INFO] ボイスチャット音声認識エンジンが待機開始しました。")
 
     # サーバー固有（ギルド）コマンドの重複を削除してグローバルコマンドに一本化
     for guild in bot.guilds:
@@ -734,6 +1015,18 @@ async def on_ready():
         print(f"[INFO] グローバルコマンド {len(global_synced)} 件を同期しました。")
     except Exception as e:
         print(f"[WARNING] グローバルコマンド同期失敗: {e}")
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """ボイスチャンネルにBot以外の参加者がいなくなった場合は自動で退出する"""
+    voice_client = member.guild.voice_client
+    if voice_client and voice_client.channel:
+        non_bot_members = [m for m in voice_client.channel.members if not m.bot]
+        if len(non_bot_members) == 0:
+            print(f"[VC INFO] {voice_client.channel.name} の参加者が0人になったため自動退出しました。")
+            if hasattr(voice_client, "is_listening") and voice_client.is_listening():
+                voice_client.stop_listening()
+            await voice_client.disconnect()
 
 
 
@@ -755,7 +1048,7 @@ async def on_message(message: discord.Message):
         return
 
     channel = message.channel
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+    if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.StageChannel)):
         await bot.process_commands(message)
         return
 
@@ -832,6 +1125,17 @@ async def on_message(message: discord.Message):
         else:
             await channel.send(
                 f"**{message.author.display_name}**: {replacement_text}"
+            )
+
+        # ボイスチャンネル（VoiceChannel または StageChannel）内のチャット発言の場合は、警告＆ペナルティ（3回で5分ミュート）も適用
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)) and message.guild and isinstance(message.author, discord.Member):
+            await handle_violation(
+                guild=message.guild,
+                member=message.author,
+                channel=channel,
+                detected_text=message.content,
+                reason=reason,
+                source="VCチャット"
             )
         return
 
@@ -1061,6 +1365,165 @@ async def cmd_ng_reload(interaction: discord.Interaction):
 
 @cmd_ng_reload.error
 async def cmd_ng_reload_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+
+# ========================================================
+# スラッシュコマンド（ボイスチャット監視・警告・ミュート管理）
+# ========================================================
+
+@bot.tree.command(name="vc_join", description="実行者が参加しているボイスチャンネルに参加し、NGワード音声監視を開始します")
+async def cmd_vc_join(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member.voice or not member.voice.channel:
+        await interaction.response.send_message("❌ 先にボイスチャンネルに参加してから実行してください。", ephemeral=True)
+        return
+
+    target_channel = member.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    await interaction.response.defer()
+
+    try:
+        if voice_client:
+            if voice_client.channel.id == target_channel.id and hasattr(voice_client, "is_listening") and voice_client.is_listening():
+                await interaction.followup.send(f"✅ すでに **{target_channel.name}** で音声監視中です！")
+                return
+            await voice_client.move_to(target_channel)
+        else:
+            voice_client = await target_channel.connect(cls=voice_recv.VoiceRecvClient)
+
+        if hasattr(voice_client, "is_listening") and voice_client.is_listening():
+            voice_client.stop_listening()
+
+        sink = BotVoiceSink(interaction.guild.id, target_channel.id)
+        voice_client.listen(sink)
+
+        embed = discord.Embed(
+            title="🔊 ボイスチャット監視開始",
+            description=f"**{target_channel.name}** に参加しました！\n通話音声＆VCチャットでのNGワードを監視します。",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="ペナルティ規則", value="NGワードを言うと警告が行き、**3回警告されると5分間マイクミュート**されます。", inline=False)
+        embed.set_footer(text="退出させるには /vc_leave を実行してください。")
+        await interaction.followup.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send("❌ ボイスチャンネルへの接続権限または発言権限がありません。Botの権限を確認してください。")
+    except Exception as e:
+        print(f"[ERROR] vc_join 失敗: {e}")
+        await interaction.followup.send(f"❌ ボイスチャンネルへの参加中にエラーが発生しました: {e}")
+
+@bot.tree.command(name="vc_leave", description="ボイスチャンネルから退出します")
+async def cmd_vc_leave(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client:
+        await interaction.response.send_message("❌ Botはボイスチャンネルに参加していません。", ephemeral=True)
+        return
+
+    channel_name = voice_client.channel.name if voice_client.channel else "ボイスチャンネル"
+    if hasattr(voice_client, "is_listening") and voice_client.is_listening():
+        voice_client.stop_listening()
+    await voice_client.disconnect()
+    await interaction.response.send_message(f"👋 **{channel_name}** から退出しました。音声監視を停止します。")
+
+@bot.tree.command(name="vc_status", description="ボイスチャット監視状態や現在の警告・ミュート状況を表示します")
+async def cmd_vc_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    voice_client = guild.voice_client
+    embed = discord.Embed(title="📊 ボイスチャット監視ステータス", color=discord.Color.blue())
+
+    if voice_client and voice_client.channel:
+        embed.add_field(name="接続中のVC", value=f"🔊 {voice_client.channel.name} (監視稼働中)", inline=False)
+    else:
+        embed.add_field(name="接続中のVC", value="未接続（/vc_join で接続）", inline=False)
+
+    # 警告中のユーザー
+    warned_users = []
+    now = time.time()
+    for (gid, uid), data in list(user_warnings.items()):
+        if gid == guild.id:
+            m = guild.get_member(uid)
+            name = m.display_name if m else f"User {uid}"
+            remain = max(0, int(3600 - (now - data["last_warned"])))
+            warned_users.append(f"・{name}: **{data['count']}/3 回** (リセットまで残り {remain // 60}分)")
+
+    embed.add_field(
+        name="現在の警告リスト",
+        value="\n".join(warned_users) if warned_users else "現在警告を受けているユーザーはいません。",
+        inline=False
+    )
+
+    # ミュート管理中
+    muted_users = []
+    for (gid, uid) in list(active_mute_tasks.keys()):
+        if gid == guild.id:
+            m = guild.get_member(uid)
+            name = m.display_name if m else f"User {uid}"
+            muted_users.append(f"・{name} (5分ペナルティ中)")
+
+    embed.add_field(
+        name="ペナルティ（ミュート）中のユーザー",
+        value="\n".join(muted_users) if muted_users else "現在ミュートペナルティ中のユーザーはいません。",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="vc_warn_reset", description="指定ユーザーのNGワード警告回数を0にリセットします")
+@app_commands.describe(user="警告をリセットするユーザー")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def cmd_vc_warn_reset(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    reset_warning(interaction.guild.id, user.id)
+    await interaction.response.send_message(f"✅ {user.mention} さんのNGワード警告回数をリセット（0回）にしました。", ephemeral=True)
+
+@cmd_vc_warn_reset.error
+async def cmd_vc_warn_reset_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+
+@bot.tree.command(name="vc_unmute", description="ペナルティ等でマイクミュートされたユーザーのミュートを手動解除します")
+@app_commands.describe(user="ミュートを解除するユーザー")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def cmd_vc_unmute(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    key = (interaction.guild.id, user.id)
+    if key in active_mute_tasks:
+        active_mute_tasks[key].cancel()
+        del active_mute_tasks[key]
+
+    try:
+        await user.edit(mute=False, reason="管理者による手動ミュート解除")
+        await interaction.response.send_message(f"🔊 {user.mention} さんのマイクミュートを手動解除しました。")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Botに「メンバーをミュート」権限がないか、対象ユーザーより権限が低いため解除できませんでした。", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 解除中にエラーが発生しました: {e}", ephemeral=True)
+
+@cmd_vc_unmute.error
+async def cmd_vc_unmute_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
     else:
